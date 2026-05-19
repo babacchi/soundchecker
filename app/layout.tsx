@@ -24,9 +24,12 @@ export default function RootLayout({
 }>) {
   return (
     <html
-      lang="en"
+      lang="ja"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
+      <head>
+        <title>Sound Checker</title>
+      </head>
       <body className="min-h-full flex flex-col">{children}</body>
     </html>
   );
