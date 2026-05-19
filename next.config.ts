@@ -1,15 +1,13 @@
 import type { NextConfig } from "next";
-const isProd = process.env.NODE_ENV === "production";
-const repositoryName = "soundchecker";
+
 const nextConfig: NextConfig = {
-  /* config options here */
-  output: "export",
-  ...(isProd
-    ? {
-        basePath: `/${repositoryName}`,
-        assetPrefix: `/${repositoryName}/`,
-      }
-    : {}),
+  output: 'export',
+  images: {
+    unoptimized: true,
+  },
+  // If you are deploying to https://<username>.github.io/<repository-name>/,
+  // uncomment the following line and replace <repository-name> with your actual repo name:
+  basePath: '/soundchecker',
 };
 
 export default nextConfig;
