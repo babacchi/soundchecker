@@ -167,9 +167,9 @@ const SoundAnalyzer: React.FC = () => {
 
     const analyser = analyserRef.current;
     if (analyser && freqDataRef.current && timeDataRef.current) {
-      // @ts-ignore: Buffer type mismatch in newer TS versions
+      // @ts-expect-error: Buffer type mismatch in newer TS versions
       analyser.getFloatFrequencyData(freqDataRef.current);
-      // @ts-ignore: Buffer type mismatch in newer TS versions
+      // @ts-expect-error: Buffer type mismatch in newer TS versions
       analyser.getFloatTimeDomainData(timeDataRef.current);
     }
 
@@ -248,9 +248,22 @@ const SoundAnalyzer: React.FC = () => {
           echoCancellation: false,
           noiseSuppression: false,
           autoGainControl: false,
-        } 
+          // Chromium-specific constraints
+          googEchoCancellation: false,
+          googAutoGainControl: false,
+          googNoiseSuppression: false,
+          googHighpassFilter: false,
+          googTypingNoiseDetection: false,
+        } as any
       });
       console.log('Microphone access granted, stream obtained.');
+      
+      // Log actual settings
+      const track = stream.getAudioTracks()[0];
+      if (track) {
+        console.log('Audio track settings:', track.getSettings());
+        console.log('Audio track constraints:', track.getConstraints());
+      }
       
       const AudioContextClass = (window.AudioContext || 
         (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext);
