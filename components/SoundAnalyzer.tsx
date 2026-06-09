@@ -28,12 +28,21 @@ const getNoteFromFreq = (freq: number): string => {
   return `${noteName}${octave}`;
 };
 
+const getCWeighting = (freq: number): number => {
+  if (freq <= 0) return -100;
+  const f2 = freq * freq;
+  const r1 = 12194 * 12194;
+  const r2 = 20.6 * 20.6;
+  const ra = (r1 * f2) / ((f2 + r2) * (f2 + r1));
+  return 20 * Math.log10(ra) + 0.06;
+};
+
 const SoundAnalyzer: React.FC = () => {
   const [isRecording, setIsRecording] = useState(false);
   const [currentDb, setCurrentDb] = useState<number>(-Infinity);
   const [maxDb, setMaxDb] = useState<number>(-Infinity);
   const [peakFreq, setPeakFreq] = useState<number>(0);
-  const [useAWeighting, setUseAWeighting] = useState(true);
+  const [weightingMode, setWeightingMode] = useState<'A' | 'C' | 'Z'>('A');
   const [responseTime, setResponseTime] = useState<'fast' | 'slow'>('fast');
   const [calibrationOffset, setCalibrationOffset] = useState(100);
   
@@ -44,16 +53,18 @@ const SoundAnalyzer: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const freqDataRef = useRef<Float32Array | null>(null);
   const timeDataRef = useRef<Float32Array | null>(null);
-  const weightingRef = useRef<Float32Array | null>(null);
+  const weightingARef = useRef<Float32Array | null>(null);
+  const weightingCRef = useRef<Float32Array | null>(null);
+  const lastUpdateRef = useRef<number>(0);
 
   // Refs for state synchronization in the update loop
-  const useAWeightingRef = useRef(useAWeighting);
+  const weightingModeRef = useRef(weightingMode);
   const responseTimeRef = useRef(responseTime);
   const calibrationOffsetRef = useRef(calibrationOffset);
 
   useEffect(() => {
-    useAWeightingRef.current = useAWeighting;
-  }, [useAWeighting]);
+    weightingModeRef.current = weightingMode;
+  }, [weightingMode]);
 
   useEffect(() => {
     responseTimeRef.current = responseTime;
@@ -162,37 +173,54 @@ const SoundAnalyzer: React.FC = () => {
   }, []);
 
   // Use a named function for the update loop to avoid hoisting/initialization issues
-  const update = useCallback(function updateLoop() {
-    if (!analyserRef.current || !freqDataRef.current || !timeDataRef.current || !weightingRef.current) return;
+  const update = useCallback(function updateLoop(timestamp: number) {
+    if (!analyserRef.current || !freqDataRef.current || !timeDataRef.current) return;
 
-    const analyser = analyserRef.current;
-    if (analyser && freqDataRef.current && timeDataRef.current) {
-      // @ts-expect-error: Buffer type mismatch in newer TS versions
-      analyser.getFloatFrequencyData(freqDataRef.current);
-      // @ts-expect-error: Buffer type mismatch in newer TS versions
-      analyser.getFloatTimeDomainData(timeDataRef.current);
+    if (lastUpdateRef.current === 0) {
+      lastUpdateRef.current = timestamp;
+      animationFrameRef.current = requestAnimationFrame(updateLoop);
+      return;
     }
 
-    let db = -Infinity;
+    const deltaTime = (timestamp - lastUpdateRef.current) / 1000; // in seconds
+    lastUpdateRef.current = timestamp;
 
-    if (useAWeightingRef.current) {
-      let sumPower = 0;
-      for (let i = 0; i < freqDataRef.current.length; i++) {
-        const weightedDb = freqDataRef.current[i] + weightingRef.current[i];
-        const power = Math.pow(10, weightedDb / 10);
-        sumPower += power;
-      }
-      db = 10 * Math.log10(sumPower + 1e-12);
-    } else {
+    const analyser = analyserRef.current;
+    // @ts-expect-error: Buffer type mismatch
+    analyser.getFloatFrequencyData(freqDataRef.current);
+    // @ts-expect-error: Buffer type mismatch
+    analyser.getFloatTimeDomainData(timeDataRef.current);
+
+    let db = -Infinity;
+    const mode = weightingModeRef.current;
+
+    if (mode === 'Z') {
+      // Z-weighting (Flat) - RMS in time domain
       let sumSquares = 0;
       for (let i = 0; i < timeDataRef.current.length; i++) {
         sumSquares += timeDataRef.current[i] * timeDataRef.current[i];
       }
       const rms = Math.sqrt(sumSquares / timeDataRef.current.length);
-      db = 20 * Math.log10(rms + 1e-9);
+      db = 20 * Math.log10(rms + 1e-12);
+    } else {
+      // A or C Weighting - Summing power in frequency domain
+      const weightings = mode === 'A' ? weightingARef.current : weightingCRef.current;
+      if (weightings) {
+        let sumPower = 0;
+        for (let i = 0; i < freqDataRef.current.length; i++) {
+          const weightedDb = freqDataRef.current[i] + weightings[i];
+          const power = Math.pow(10, weightedDb / 10);
+          sumPower += power;
+        }
+        // Normalize by FFT size for power summation
+        db = 10 * Math.log10(sumPower / (analyser.fftSize / 2) + 1e-12);
+      }
     }
     
-    const alpha = responseTimeRef.current === 'fast' ? 0.2 : 0.05;
+    // Professional time weighting: alpha = 1 - exp(-dt / tau)
+    // Fast: 125ms (0.125s), Slow: 1s
+    const tau = responseTimeRef.current === 'fast' ? 0.125 : 1.0;
+    const alpha = 1 - Math.exp(-deltaTime / tau);
 
     setCurrentDb(prev => {
         if (prev === -Infinity) return db;
@@ -201,7 +229,7 @@ const SoundAnalyzer: React.FC = () => {
     
     setMaxDb(prev => Math.max(prev, db));
 
-    // Detect peak frequency with parabolic interpolation for better accuracy
+    // Detect peak frequency with parabolic interpolation
     let maxMag = -Infinity;
     let maxIndex = -1;
     const currentSampleRate = audioContextRef.current?.sampleRate || 44100;
@@ -216,13 +244,12 @@ const SoundAnalyzer: React.FC = () => {
 
     let freq = 0;
     if (maxIndex > 0 && maxIndex < freqDataRef.current.length - 1) {
-        // Parabolic interpolation: p = 0.5 * (alpha - gamma) / (alpha - 2*beta + gamma)
-        const alpha = freqDataRef.current[maxIndex - 1];
-        const beta = freqDataRef.current[maxIndex];
-        const gamma = freqDataRef.current[maxIndex + 1];
-        const denominator = (alpha - 2 * beta + gamma);
+        const alphaP = freqDataRef.current[maxIndex - 1];
+        const betaP = freqDataRef.current[maxIndex];
+        const gammaP = freqDataRef.current[maxIndex + 1];
+        const denominator = (alphaP - 2 * betaP + gammaP);
         if (Math.abs(denominator) > 1e-6) {
-            const p = 0.5 * (alpha - gamma) / denominator;
+            const p = 0.5 * (alphaP - gammaP) / denominator;
             freq = (maxIndex + p) * currentSampleRate / analyser.fftSize;
         } else {
             freq = maxIndex * currentSampleRate / analyser.fftSize;
@@ -279,7 +306,9 @@ const SoundAnalyzer: React.FC = () => {
       audioContextRef.current = audioContext;
 
       const analyser = audioContext.createAnalyser();
-      analyser.fftSize = 8192;
+      analyser.fftSize = 16384; // Higher resolution
+      analyser.minDecibels = -140;
+      analyser.maxDecibels = 0;
       analyserRef.current = analyser;
 
       const source = audioContext.createMediaStreamSource(stream);
@@ -291,14 +320,18 @@ const SoundAnalyzer: React.FC = () => {
       timeDataRef.current = new Float32Array(analyser.fftSize);
 
       const sampleRate = audioContext.sampleRate;
-      const weightings = new Float32Array(bufferLength);
+      const weightingsA = new Float32Array(bufferLength);
+      const weightingsC = new Float32Array(bufferLength);
       for (let i = 0; i < bufferLength; i++) {
         const freq = (i * sampleRate) / analyser.fftSize;
-        weightings[i] = getAWeighting(freq);
+        weightingsA[i] = getAWeighting(freq);
+        weightingsC[i] = getCWeighting(freq);
       }
-      weightingRef.current = weightings;
+      weightingARef.current = weightingsA;
+      weightingCRef.current = weightingsC;
 
       setIsRecording(true);
+      lastUpdateRef.current = 0;
       console.log('State set to recording, starting update loop.');
       animationFrameRef.current = requestAnimationFrame(update);
     } catch (err) {
@@ -334,14 +367,19 @@ const SoundAnalyzer: React.FC = () => {
                     onClick={() => setResponseTime(t => t === 'fast' ? 'slow' : 'fast')}
                     className="px-3 py-1 text-xs font-semibold rounded-md border border-zinc-200 dark:border-zinc-700 text-zinc-500 uppercase"
                 >
-                    Response: {responseTime}
+                    {responseTime}
                 </button>
-                <button 
-                    onClick={() => setUseAWeighting(!useAWeighting)}
-                    className={`px-3 py-1 text-xs font-semibold rounded-md border transition-colors ${useAWeighting ? 'bg-blue-100 border-blue-200 text-blue-600 dark:bg-blue-900/30 dark:border-blue-800 dark:text-blue-400' : 'border-zinc-200 dark:border-zinc-700 text-zinc-500'}`}
-                >
-                    A-Weighting: {useAWeighting ? 'ON' : 'OFF'}
-                </button>
+                <div className="flex bg-zinc-100 dark:bg-zinc-800 p-0.5 rounded-md border border-zinc-200 dark:border-zinc-700">
+                    {(['A', 'C', 'Z'] as const).map((m) => (
+                        <button
+                            key={m}
+                            onClick={() => setWeightingMode(m)}
+                            className={`px-2 py-0.5 text-[10px] font-bold rounded transition-all ${weightingMode === m ? 'bg-white dark:bg-zinc-700 text-blue-600 dark:text-blue-400 shadow-sm' : 'text-zinc-400 hover:text-zinc-600'}`}
+                        >
+                            {m}
+                        </button>
+                    ))}
+                </div>
             </div>
         </div>
 
@@ -376,7 +414,7 @@ const SoundAnalyzer: React.FC = () => {
           <span className="text-6xl font-mono font-black text-blue-600 dark:text-blue-400 mt-2">
             {displayDb(currentDb)}
           </span>
-          <span className="text-sm font-bold text-zinc-400 mt-2">{useAWeighting ? 'dB(A)' : 'dB'}</span>
+          <span className="text-sm font-bold text-zinc-400 mt-2">dB({weightingMode})</span>
         </div>
         
         <div className="relative flex flex-col items-center p-8 bg-zinc-50 dark:bg-zinc-800/30 rounded-2xl border border-zinc-100 dark:border-zinc-800/50">
@@ -384,7 +422,7 @@ const SoundAnalyzer: React.FC = () => {
           <span className="text-6xl font-mono font-black text-red-500 dark:text-red-400 mt-2">
             {displayDb(maxDb)}
           </span>
-          <span className="text-sm font-bold text-zinc-400 mt-2">{useAWeighting ? 'dB(A)' : 'dB'}</span>
+          <span className="text-sm font-bold text-zinc-400 mt-2">dB({weightingMode})</span>
         </div>
       </div>
 
