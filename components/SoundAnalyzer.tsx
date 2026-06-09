@@ -18,9 +18,11 @@ const getAWeighting = (freq: number): number => {
 
 // Utility to convert frequency to musical note
 const getNoteFromFreq = (freq: number): string => {
+  if (freq <= 0) return "";
   const notes = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
   const halfStepsFromA4 = 12 * Math.log2(freq / 440);
   const noteIndex = Math.round(halfStepsFromA4) + 69; // 69 is MIDI for A4
+  if (noteIndex < 0 || noteIndex > 127) return ""; 
   const octave = Math.floor(noteIndex / 12) - 1;
   const noteName = notes[noteIndex % 12];
   return `${noteName}${octave}`;
@@ -92,14 +94,20 @@ const SoundAnalyzer: React.FC = () => {
     const sampleRate = audioContextRef.current?.sampleRate || 44100;
     const minFreq = 20;
     const maxFreq = 20000;
-    const freqLabels = [100, 1000, 5000, 10000, 15000, 20000];
+    const logMin = Math.log10(minFreq);
+    const logMax = Math.log10(maxFreq);
+    
+    const freqLabels = [20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000];
     
     ctx.font = 'bold 12px Inter, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
 
     const getX = (freq: number) => {
-        return ((freq - minFreq) / (maxFreq - minFreq)) * width;
+        if (freq <= minFreq) return 0;
+        if (freq >= maxFreq) return width;
+        const logF = Math.log10(freq);
+        return ((logF - logMin) / (logMax - logMin)) * width;
     };
 
     freqLabels.forEach(f => {
@@ -125,6 +133,7 @@ const SoundAnalyzer: React.FC = () => {
 
     const freqStep = (sampleRate / 2) / bufferLength;
 
+    let first = true;
     for (let i = 0; i < bufferLength; i++) {
       const f = i * freqStep;
       if (f < minFreq) continue;
@@ -132,10 +141,11 @@ const SoundAnalyzer: React.FC = () => {
 
       const x = getX(f);
       const v = (dataArray[i] + 120) / 120;
-      const y = chartHeight - (v * chartHeight);
+      const y = chartHeight - (Math.max(0, Math.min(1, v)) * chartHeight);
 
-      if (i === 0 || f >= minFreq && i > 0 && (i-1)*freqStep < minFreq) {
+      if (first) {
         ctx.moveTo(x, y);
+        first = false;
       } else {
         ctx.lineTo(x, y);
       }
@@ -157,9 +167,10 @@ const SoundAnalyzer: React.FC = () => {
 
     const analyser = analyserRef.current;
     if (analyser && freqDataRef.current && timeDataRef.current) {
-      // as any を使って型チェックをスキップ
-      analyser.getFloatFrequencyData(freqDataRef.current as any);
-      analyser.getFloatTimeDomainData(timeDataRef.current as any);
+      // @ts-ignore: Buffer type mismatch in newer TS versions
+      analyser.getFloatFrequencyData(freqDataRef.current);
+      // @ts-ignore: Buffer type mismatch in newer TS versions
+      analyser.getFloatTimeDomainData(timeDataRef.current);
     }
 
     let db = -Infinity;
@@ -190,18 +201,35 @@ const SoundAnalyzer: React.FC = () => {
     
     setMaxDb(prev => Math.max(prev, db));
 
-    // Detect peak frequency
+    // Detect peak frequency with parabolic interpolation for better accuracy
     let maxMag = -Infinity;
-    let maxIndex = 0;
-    // We skip the very low frequencies (0-20Hz) as they are often noise
-    const startBin = Math.floor(20 / (audioContextRef.current?.sampleRate || 44100) * analyser.fftSize);
+    let maxIndex = -1;
+    const currentSampleRate = audioContextRef.current?.sampleRate || 44100;
+    const startBin = Math.floor(20 / currentSampleRate * analyser.fftSize);
+    
     for (let i = startBin; i < freqDataRef.current.length; i++) {
         if (freqDataRef.current[i] > maxMag) {
             maxMag = freqDataRef.current[i];
             maxIndex = i;
         }
     }
-    const freq = maxIndex * (audioContextRef.current?.sampleRate || 44100) / analyser.fftSize;
+
+    let freq = 0;
+    if (maxIndex > 0 && maxIndex < freqDataRef.current.length - 1) {
+        // Parabolic interpolation: p = 0.5 * (alpha - gamma) / (alpha - 2*beta + gamma)
+        const alpha = freqDataRef.current[maxIndex - 1];
+        const beta = freqDataRef.current[maxIndex];
+        const gamma = freqDataRef.current[maxIndex + 1];
+        const denominator = (alpha - 2 * beta + gamma);
+        if (Math.abs(denominator) > 1e-6) {
+            const p = 0.5 * (alpha - gamma) / denominator;
+            freq = (maxIndex + p) * currentSampleRate / analyser.fftSize;
+        } else {
+            freq = maxIndex * currentSampleRate / analyser.fftSize;
+        }
+    } else if (maxIndex !== -1) {
+        freq = maxIndex * currentSampleRate / analyser.fftSize;
+    }
     setPeakFreq(freq);
 
     drawCanvas();
@@ -215,7 +243,13 @@ const SoundAnalyzer: React.FC = () => {
         throw new Error('ブラウザがマイク入力をサポートしていません。');
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        } 
+      });
       console.log('Microphone access granted, stream obtained.');
       
       const AudioContextClass = (window.AudioContext || 
@@ -232,7 +266,7 @@ const SoundAnalyzer: React.FC = () => {
       audioContextRef.current = audioContext;
 
       const analyser = audioContext.createAnalyser();
-      analyser.fftSize = 4096;
+      analyser.fftSize = 8192;
       analyserRef.current = analyser;
 
       const source = audioContext.createMediaStreamSource(stream);
@@ -329,7 +363,7 @@ const SoundAnalyzer: React.FC = () => {
           <span className="text-6xl font-mono font-black text-blue-600 dark:text-blue-400 mt-2">
             {displayDb(currentDb)}
           </span>
-          <span className="text-sm font-bold text-zinc-400 mt-2">dB(A)</span>
+          <span className="text-sm font-bold text-zinc-400 mt-2">{useAWeighting ? 'dB(A)' : 'dB'}</span>
         </div>
         
         <div className="relative flex flex-col items-center p-8 bg-zinc-50 dark:bg-zinc-800/30 rounded-2xl border border-zinc-100 dark:border-zinc-800/50">
@@ -337,7 +371,7 @@ const SoundAnalyzer: React.FC = () => {
           <span className="text-6xl font-mono font-black text-red-500 dark:text-red-400 mt-2">
             {displayDb(maxDb)}
           </span>
-          <span className="text-sm font-bold text-zinc-400 mt-2">dB(A)</span>
+          <span className="text-sm font-bold text-zinc-400 mt-2">{useAWeighting ? 'dB(A)' : 'dB'}</span>
         </div>
       </div>
 
