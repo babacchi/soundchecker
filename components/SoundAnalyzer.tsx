@@ -212,8 +212,8 @@ const SoundAnalyzer: React.FC = () => {
           const power = Math.pow(10, weightedDb / 10);
           sumPower += power;
         }
-        // Normalize by FFT size for power summation
-        db = 10 * Math.log10(sumPower / (analyser.fftSize / 2) + 1e-12);
+        // Total power is the sum of powers across all bins
+        db = 10 * Math.log10(sumPower + 1e-12);
       }
     }
     
